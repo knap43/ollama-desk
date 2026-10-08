@@ -21,6 +21,7 @@ try:  # GLib >= 2.80 moved DesktopAppInfo into GioUnix
 except (ValueError, ImportError):
     DesktopAppInfo = Gio.DesktopAppInfo
 
+import base64
 import glob
 import http.client
 import json
@@ -66,21 +67,7 @@ SUGGESTIONS = [
     "Open the Files app in my Downloads folder",
 ]
 
-# Accent: #e1a34f, darkened to #946c34 wherever it sits behind white text or on light backgrounds
-# (4.5:1 contrast). On dark backgrounds the original #e1a34f is readable as is.
 CSS = """
-@define-color accent_bg_color #946c34;
-@define-color accent_fg_color #ffffff;
-@define-color accent_color #946c34;
-:root {
-  --accent-bg-color: #946c34;
-  --accent-fg-color: #ffffff;
-  --accent-color: #946c34;
-}
-@media (prefers-color-scheme: dark) {
-  :root { --accent-color: #e1a34f; }
-}
-
 .chat-column { padding: 28px 18px 12px 18px; }
 
 .bubble-user {
@@ -105,13 +92,32 @@ CSS = """
   background-color: @view_bg_color;
   background-color: var(--view-bg-color);
   border-radius: 24px;
-  padding: 4px 6px 4px 16px;
+  padding: 4px 6px 4px 6px;
   box-shadow: 0 0 0 1px alpha(currentColor, 0.10), 0 4px 16px alpha(black, 0.08);
 }
 textview.composer-text, textview.composer-text > text { background: none; }
 
 .thinking-text { font-size: 0.92em; }
 .tool-output { font-family: monospace; font-size: 0.88em; }
+
+.attachment-chip {
+  background-color: alpha(currentColor, 0.08);
+  border-radius: 10px;
+  padding: 2px 2px 2px 10px;
+}
+.bubble-files .attachment-chip { padding: 4px 10px; }
+.attachment-chip label { font-weight: normal; }
+.drop-zone {
+  background-color: alpha(@accent_bg_color, 0.10);
+  border: 2px dashed alpha(@accent_bg_color, 0.7);
+  border-radius: 20px;
+  margin: 10px;
+}
+.composer-meta { padding: 0 10px; }
+levelbar.context-meter > trough { min-height: 6px; }
+levelbar.context-meter block.filled.ctx-ok { background-color: @accent_bg_color; }
+levelbar.context-meter block.filled.ctx-warn { background-color: @warning_bg_color; }
+levelbar.context-meter block.filled.ctx-full { background-color: @error_bg_color; }
 
 row .row-delete { opacity: 0; transition: opacity 150ms ease-out; }
 row:hover .row-delete, row:selected .row-delete { opacity: 1; }
@@ -458,6 +464,10 @@ TIPS = {
     "num_batch": "How many tokens of your message the model reads in one go before it starts replying. Larger "
                  "values read long messages faster but need more memory. Lower it if long chats fail with "
                  "out-of-memory errors.",
+    "think": "Thinking models can reason step by step before they answer. That usually helps with maths, code "
+             "and tricky questions, but takes longer and fills up the context. Off answers straight away. Some "
+             "models, like gpt-oss, offer low, medium and high levels instead, and can't switch thinking off. "
+             "Saved for each model.",
     "keep_alive": "Loading a model into memory takes a few seconds. Keeping it loaded means the next reply "
                   "starts right away, but the memory stays occupied for other programs. Ollama's default is "
                   "5 minutes.",
@@ -497,10 +507,125 @@ def parse_model_info(raw):
     return {"defaults": defaults, "ctx_max": ctx_max,
             "summary": " ".join(str(b) for b in (d.get("family"), d.get("parameter_size"),
                                                  d.get("quantization_level")) if b),
-            "tools": None if caps is None else "tools" in caps}
+            "family": str(d.get("family") or ""),
+            "tools": None if caps is None else "tools" in caps,
+            "thinking": None if caps is None else "thinking" in caps,
+            "vision": None if caps is None else "vision" in caps}
 
 
-EMPTY_INFO = {"defaults": {}, "ctx_max": None, "summary": "", "tools": None}
+EMPTY_INFO = {"defaults": {}, "ctx_max": None, "summary": "", "family": "", "tools": None, "thinking": None,
+              "vision": None, "levels": False}
+
+THINK_BOOL = [("Model default", None), ("Off", False), ("On", True)]
+THINK_LEVELS = [("Model default", None), ("Low", "low"), ("Medium", "medium"), ("High", "high")]
+
+
+def short_count(n):
+    return str(n) if n < 1000 else f"{n / 1000:.1f}k" if n < 10000 else f"{n / 1000:.0f}k"
+
+
+def estimate_tokens(text):
+    """Rough token count: about 3.5 characters per token across English, code and Cyrillic text."""
+    return int(len(text) / 3.5) + 1
+
+
+# ── attachments ──
+MAX_ATTACH_CHARS = 200_000
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+TEXTISH_TYPES = ("application/json", "application/xml", "application/javascript", "application/x-shellscript",
+                 "application/toml", "application/x-yaml", "application/sql", "image/svg+xml")
+
+
+def load_attachment(path):
+    """Turn a file into something a model can take: image data or plain text. Raises ValueError if it can't."""
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError(f"{p.name} isn't a regular file.")
+    with open(p, "rb") as f:
+        head = f.read(8192)
+    mime, _uncertain = Gio.content_type_guess(str(p), head)
+    mime = Gio.content_type_get_mime_type(mime) or mime or ""
+    att = {"name": p.name, "path": str(p), "truncated": False}
+
+    if mime.startswith("image/") and mime not in TEXTISH_TYPES:
+        if p.stat().st_size > MAX_IMAGE_BYTES:
+            raise ValueError(f"{p.name} is larger than 20 MB.")
+        if mime in ("image/png", "image/jpeg"):
+            data = p.read_bytes()
+        else:  # webp, gif, bmp, … → PNG, which every vision model accepts
+            try:
+                data = Gdk.Texture.new_from_filename(str(p)).save_to_png_bytes().get_data()
+            except GLib.Error as e:
+                raise ValueError(f"Couldn't read the image {p.name}: {e.message}")
+        att.update(kind="image", b64=base64.b64encode(data).decode(), tokens=0)
+        return att
+
+    if mime == "application/pdf":
+        if not shutil.which("pdftotext"):
+            raise ValueError("Attaching PDFs needs pdftotext: sudo pacman -S poppler")
+        r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", str(p), "-"], capture_output=True,
+                           timeout=60)
+        if r.returncode != 0:
+            raise ValueError(f"Couldn't read {p.name}: {r.stderr.decode(errors='replace').strip()}")
+        text = r.stdout.decode("utf-8", errors="replace")
+        if not text.strip():
+            raise ValueError(f"{p.name} has no text layer (it may be a scan).")
+        att["kind"] = "pdf"
+    else:
+        if b"\0" in head:
+            raise ValueError(f"{p.name} isn't a text, image or PDF file.")
+        raw = p.read_bytes()[: MAX_ATTACH_CHARS * 4]
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("cp1251")  # older Russian text files
+            except UnicodeDecodeError:
+                text = raw.decode("utf-8", errors="replace")
+        att["kind"] = "text"
+    if len(text) > MAX_ATTACH_CHARS:
+        text, att["truncated"] = text[:MAX_ATTACH_CHARS], True
+    att.update(text=text, tokens=estimate_tokens(text))
+    return att
+
+
+def compose_message(text, atts):
+    """Build the user message: the typed text, then each text file in a fenced block, plus image data."""
+    parts = [text] if text else []
+    for a in atts:
+        if a["kind"] == "image":
+            parts.append(f"[Attached image: {a['name']}]")
+            continue
+        body = a["text"]
+        fence = "`" * max(3, max((len(m) for m in re.findall(r"`+", body)), default=0) + 1)
+        what = "Text extracted from the PDF" if a["kind"] == "pdf" else "Attached file"
+        note = " (cut short, it was too long)" if a["truncated"] else ""
+        parts.append(f"{what} {a['name']} ({a['path']}){note}:\n{fence}\n{body}\n{fence}")
+    msg = {"role": "user", "content": "\n\n".join(parts), "_display": text,
+           "_files": [{"name": a["name"], "path": a["path"], "kind": a["kind"]} for a in atts]}
+    images = [a["b64"] for a in atts if a["kind"] == "image"]
+    if images:
+        msg["images"] = images
+    return msg
+
+
+FILE_ICONS = {"image": "image-x-generic-symbolic", "pdf": "x-office-document-symbolic",
+              "text": "text-x-generic-symbolic"}
+
+
+def make_wrap():
+    if hasattr(Adw, "WrapBox"):
+        return Adw.WrapBox(child_spacing=6, line_spacing=6)
+    return Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=6, row_spacing=6,
+                       max_children_per_line=12)
+
+
+def clear_children(box):
+    child = box.get_first_child()
+    while child:
+        nxt = child.get_next_sibling()
+        box.remove(child)
+        child = nxt
 
 
 def format_stats(s):
@@ -1416,11 +1541,32 @@ class AssistantStep(Gtk.Box):
 
 
 class UserBubble(Gtk.Box):
-    def __init__(self, text):
-        super().__init__(halign=Gtk.Align.END, margin_start=64)
-        lbl = text_label(text, "bubble-user")
-        lbl.set_max_width_chars(56)
-        self.append(lbl)
+    def __init__(self, text, files=()):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.END, margin_start=64)
+        if files:
+            if hasattr(Adw, "WrapBox"):
+                wrap = Adw.WrapBox(child_spacing=6, line_spacing=6, align=1.0, halign=Gtk.Align.END)
+            else:  # older libadwaita: one chip per line
+                wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.END)
+            wrap.add_css_class("bubble-files")
+            for f in files:
+                chip = Gtk.Button(tooltip_text=f"Open {f['path']}")
+                chip.add_css_class("flat")
+                chip.add_css_class("attachment-chip")
+                inner = Gtk.Box(spacing=6)
+                inner.append(Gtk.Image.new_from_icon_name(FILE_ICONS.get(f.get("kind"), "text-x-generic-symbolic")))
+                inner.append(Gtk.Label(label=f["name"], ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=28))
+                chip.set_child(inner)
+                chip.set_halign(Gtk.Align.END)
+                chip.connect("clicked", lambda b, path=f["path"]: Gtk.FileLauncher.new(
+                    Gio.File.new_for_path(path)).launch(b.get_root(), None, None))
+                wrap.append(chip)
+            self.append(wrap)
+        if text:
+            lbl = text_label(text, "bubble-user")
+            lbl.set_max_width_chars(56)
+            lbl.set_halign(Gtk.Align.END)
+            self.append(lbl)
 
 
 class ConvRow(Gtk.ListBoxRow):
@@ -1450,6 +1596,9 @@ class Window(Adw.ApplicationWindow):
         self.conv = None
         self.models = []
         self.model_info = {}
+        self.attachments = []
+        self._updating_think = False
+        self._ctx = None  # (tokens used, approximate?) for the open chat
         self.generating = False
         self.cancel = threading.Event()
         self.client = None
@@ -1529,8 +1678,28 @@ class Window(Adw.ApplicationWindow):
         view.add_top_bar(self.banner)
         view.add_bottom_bar(self._build_composer())
 
-        self.toasts = Adw.ToastOverlay(child=view)
+        drop_overlay = Gtk.Overlay(child=view)
+        self.drop_zone = Adw.StatusPage(icon_name="mail-attachment-symbolic", title="Drop to attach",
+                                        description="Text, code, PDFs and images", visible=False, can_target=False)
+        self.drop_zone.add_css_class("drop-zone")
+        drop_overlay.add_overlay(self.drop_zone)
+        target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        target.connect("enter", lambda *_: (self.drop_zone.set_visible(True), Gdk.DragAction.COPY)[1])
+        target.connect("leave", lambda *_: self.drop_zone.set_visible(False))
+        target.connect("drop", self._on_drop)
+        drop_overlay.add_controller(target)
+
+        self.toasts = Adw.ToastOverlay(child=drop_overlay)
         return Adw.NavigationPage(title=APP_NAME, child=self.toasts)
+
+    def _on_drop(self, _target, value, _x, _y):
+        self.drop_zone.set_visible(False)
+        paths = [f.get_path() for f in value.get_files() if f.get_path()]
+        if not paths:
+            self.toast("Only local files can be attached")
+            return False
+        self.add_attachments(paths)
+        return True
 
     def _build_empty(self):
         page = Adw.StatusPage(icon_name="computer-symbolic", title="Ask anything",
@@ -1559,6 +1728,12 @@ class Window(Adw.ApplicationWindow):
         keys.connect("key-pressed", self._on_key)
         self.input.add_controller(keys)
 
+        attach = Gtk.Button(icon_name="mail-attachment-symbolic", valign=Gtk.Align.END, margin_bottom=2,
+                            tooltip_text="Attach files (Ctrl+O), or drop them anywhere in the chat",
+                            action_name="app.attach")
+        attach.add_css_class("flat")
+        attach.add_css_class("circular")
+
         self.send_btn = Gtk.Button(icon_name="go-up-symbolic", valign=Gtk.Align.END, margin_bottom=2,
                                    tooltip_text="Send (Enter)")
         self.send_btn.add_css_class("circular")
@@ -1567,11 +1742,53 @@ class Window(Adw.ApplicationWindow):
 
         frame = Gtk.Box(spacing=6)
         frame.add_css_class("composer")
+        frame.append(attach)
         frame.append(Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
                                         max_content_height=220, hexpand=True, child=overlay))
         frame.append(self.send_btn)
-        return Adw.Clamp(maximum_size=820, child=frame, margin_start=12, margin_end=12,
-                         margin_top=6, margin_bottom=16)
+
+        self.chips = make_wrap()
+        self.chips.set_margin_start(8)
+        self.chips.set_visible(False)
+
+        # thinking control
+        self.think_list = Gtk.StringList()
+        self.think_values = []
+        self.think_dd = Gtk.DropDown(model=self.think_list, tooltip_text=TIPS["think"])
+        self.think_dd.add_css_class("flat")
+        self.think_dd.connect("notify::selected", self._on_think_selected)
+        think_lbl = Gtk.Label(label="Thinking")
+        think_lbl.add_css_class("dim-label")
+        think_lbl.add_css_class("caption")
+        self.think_box = Gtk.Box(spacing=2, visible=False)
+        self.think_box.append(think_lbl)
+        self.think_box.append(self.think_dd)
+
+        # context meter
+        self.ctx_label = Gtk.Label()
+        for c in ("caption", "dim-label", "numeric"):
+            self.ctx_label.add_css_class(c)
+        self.ctx_bar = Gtk.LevelBar(min_value=0, max_value=1, valign=Gtk.Align.CENTER, width_request=72)
+        self.ctx_bar.add_css_class("context-meter")
+        for name in ("low", "high", "full"):
+            self.ctx_bar.remove_offset_value(name)
+        for name, value in (("ctx-ok", 0.75), ("ctx-warn", 0.9), ("ctx-full", 1.0)):
+            self.ctx_bar.add_offset_value(name, value)
+        self.ctx_box = Gtk.Box(spacing=8, halign=Gtk.Align.END, hexpand=True)
+        self.ctx_box.append(self.ctx_label)
+        self.ctx_box.append(self.ctx_bar)
+
+        meta = Gtk.Box(spacing=6)
+        meta.add_css_class("composer-meta")
+        meta.append(self.think_box)
+        meta.append(self.ctx_box)
+
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        column.append(self.chips)
+        column.append(frame)
+        column.append(meta)
+        return Adw.Clamp(maximum_size=820, child=column, margin_start=12, margin_end=12,
+                         margin_top=6, margin_bottom=10)
 
     # ── small helpers ──
     def toast(self, message):
@@ -1627,6 +1844,7 @@ class Window(Adw.ApplicationWindow):
             if want not in models:
                 self._set_cfg("model", models[0])
         self._updating_models = False
+        self._model_changed()
 
         if error:
             self.banner.set_title(f"Ollama isn't reachable at {self.cfg['host']}. Start it with “ollama serve”.")
@@ -1642,6 +1860,148 @@ class Window(Adw.ApplicationWindow):
     def _on_model_selected(self, *_):
         if not self._updating_models and self.models:
             self._set_cfg("model", self.current_model())
+            self._model_changed()
+
+    def _model_changed(self):
+        model = self.current_model()
+        if not model:
+            self.think_box.set_visible(False)
+            self._update_ctx()
+            return
+        if model in self.model_info:
+            self._apply_model_ui(model)
+            return
+
+        def work():
+            self._fetch_info(model)
+            GLib.idle_add(lambda: self.current_model() == model and self._apply_model_ui(model) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_model_ui(self, model):
+        info = self.model_info.get(model) or dict(EMPTY_INFO)
+        choices = THINK_LEVELS if info.get("levels") else THINK_BOOL
+        self._updating_think = True
+        self.think_values = [v for _, v in choices]
+        self.think_list.splice(0, self.think_list.get_n_items(), [label for label, _ in choices])
+        current = self.cfg.get("model_options", {}).get(model, {}).get("think")
+        self.think_dd.set_selected(self.think_values.index(current) if current in self.think_values else 0)
+        self._updating_think = False
+        self.think_box.set_visible(info.get("thinking") is not False)
+        self._update_ctx()
+        return False
+
+    def _on_think_selected(self, *_):
+        model = self.current_model()
+        i = self.think_dd.get_selected()
+        if self._updating_think or not model or not 0 <= i < len(self.think_values):
+            return
+        self._set_override(model, "think", self.think_values[i], None)
+
+    def think_value(self, model):
+        return self.cfg.get("model_options", {}).get(model, {}).get("think")
+
+    # ── context meter ──
+    def _context_limit(self, model):
+        info = self.model_info.get(model) or dict(EMPTY_INFO)
+        return self.request_options(model, info)[0]["num_ctx"]
+
+    def _set_ctx(self, used, approx):
+        self._ctx = (used, approx) if used else None
+        self._update_ctx()
+        return False
+
+    def _update_ctx(self):
+        model = self.current_model()
+        self.ctx_box.set_visible(bool(model))
+        if not model:
+            return
+        limit = self._context_limit(model)
+        used, approx = self._ctx or (0, False)
+        frac = min(used / limit, 1.0) if limit else 0
+        self.ctx_bar.set_value(frac)
+        prefix = "≈ " if approx else ""
+        self.ctx_label.set_text(f"{prefix}{short_count(used)} / {short_count(limit)} tokens" if used
+                                else f"{short_count(limit)} token context")
+        tip = (f"Context: {used:,} of {limit:,} tokens used ({frac:.0%})." if used else
+               f"This model can keep {limit:,} tokens in view.")
+        tip += (" The context is everything the model sees at once: instructions, earlier messages, attached "
+                "files and tool results. Once it's full, the oldest parts are forgotten. Start a new chat, or "
+                "raise Context length in Tune (Ctrl+T) if your computer has memory to spare.")
+        if approx:
+            tip += " This figure is estimated."
+        if frac >= 0.9:
+            tip = "Almost full: the model may be forgetting the start of this chat.\n\n" + tip
+        self.ctx_box.set_tooltip_text(tip)
+
+    @staticmethod
+    def _ctx_from(msgs):
+        for m in reversed(msgs):
+            if m.get("role") == "assistant" and m.get("_ctx"):
+                return tuple(m["_ctx"])
+        return None
+
+    # ── attachments ──
+    def pick_files(self):
+        dialog = Gtk.FileDialog(title="Attach files")
+
+        def chosen(d, result):
+            try:
+                files = d.open_multiple_finish(result)
+            except GLib.Error:
+                return  # cancelled
+            self.add_attachments([f.get_path() for f in files if f.get_path()])
+
+        dialog.open_multiple(self, None, chosen)
+
+    def add_attachments(self, paths):
+        def work():
+            loaded, errors = [], []
+            for path in paths:
+                try:
+                    loaded.append(load_attachment(path))
+                except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+                    errors.append(str(e))
+            GLib.idle_add(self._attachments_loaded, loaded, errors)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _attachments_loaded(self, loaded, errors):
+        known = {a["path"] for a in self.attachments}
+        self.attachments += [a for a in loaded if a["path"] not in known]
+        self._refresh_chips()
+        if errors:
+            self.toast(errors[0] if len(errors) == 1 else f"{len(errors)} files couldn't be attached. {errors[0]}")
+        model = self.current_model()
+        if model and any(a["kind"] == "image" for a in loaded):
+            if (self.model_info.get(model) or {}).get("vision") is False:
+                self.toast(f"{model} can't see images. Pick a vision model before sending.")
+        self.input.grab_focus()
+        return False
+
+    def _refresh_chips(self):
+        clear_children(self.chips)
+        for a in self.attachments:
+            chip = Gtk.Box(spacing=6)
+            chip.add_css_class("attachment-chip")
+            chip.append(Gtk.Image.new_from_icon_name(FILE_ICONS[a["kind"]]))
+            name = Gtk.Label(label=a["name"], ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=28)
+            chip.append(name)
+            tip = a["path"]
+            if a["kind"] != "image":
+                tip += f"\nAbout {a['tokens']:,} tokens"
+            if a["truncated"]:
+                tip += "\nCut short: only the first part will be sent"
+            chip.set_tooltip_text(tip)
+            remove = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Remove", valign=Gtk.Align.CENTER)
+            for c in ("flat", "circular"):
+                remove.add_css_class(c)
+            remove.connect("clicked", lambda _b, path=a["path"]: self._remove_attachment(path))
+            chip.append(remove)
+            self.chips.append(chip)
+        self.chips.set_visible(bool(self.attachments))
+
+    def _remove_attachment(self, path):
+        self.attachments = [a for a in self.attachments if a["path"] != path]
+        self._refresh_chips()
 
     # ── conversations ──
     def _refresh_sidebar(self):
@@ -1667,6 +2027,7 @@ class Window(Adw.ApplicationWindow):
             return
         self.conv = None
         self._clear_chat()
+        self._set_ctx(0, False)
         self.stack.set_visible_child_name("empty")
         self._suppress_select = True
         self.sidebar_list.unselect_all()
@@ -1681,7 +2042,7 @@ class Window(Adw.ApplicationWindow):
         for m in conv.get("messages", []):
             role = m.get("role")
             if role == "user":
-                self.chat_box.append(UserBubble(m.get("content", "")))
+                self.chat_box.append(UserBubble(m.get("_display", m.get("content", "")), m.get("_files") or ()))
                 pending = []
             elif role == "assistant":
                 step = AssistantStep(self.cfg["show_stats"])
@@ -1695,6 +2056,7 @@ class Window(Adw.ApplicationWindow):
                 pending.pop(0).set_result(m.get("_status", "ok"), m.get("content", ""))
         if conv.get("model") in self.models:
             self.model_dd.set_selected(self.models.index(conv["model"]))
+        self._set_ctx(*(self._ctx_from(conv.get("messages", [])) or (0, False)))
         self._stick = True
         self.stack.set_visible_child_name("chat" if conv.get("messages") else "empty")
         self.input.grab_focus()
@@ -1730,24 +2092,37 @@ class Window(Adw.ApplicationWindow):
 
     def send_text(self, text):
         text = text.strip()
-        if not text or self.generating:
+        atts = list(self.attachments)
+        if (not text and not atts) or self.generating:
             return False
         model = self.current_model()
         if not model:
             self.toast("Choose a model first. Is Ollama running?")
             return False
+        if any(a["kind"] == "image" for a in atts) and (self.model_info.get(model) or {}).get("vision") is False:
+            self.toast(f"{model} can't see images. Choose a vision model, or remove the images.")
+            return False
+        file_tokens = sum(a["tokens"] for a in atts)
+        limit = self._context_limit(model)
+        if file_tokens > limit * 0.8:
+            self.toast(f"The attached text is about {short_count(file_tokens)} tokens, too much for this "
+                       f"model's {short_count(limit)} context. Parts will be forgotten; raise it in Tune.")
         now = time.time()
         if self.conv is None:
-            self.conv = {"id": uuid.uuid4().hex, "title": text.splitlines()[0][:60], "model": model,
+            title = text.splitlines()[0][:60] if text else ", ".join(a["name"] for a in atts)[:60]
+            self.conv = {"id": uuid.uuid4().hex, "title": title, "model": model,
                          "created": now, "updated": now, "messages": []}
             self.convs.insert(0, self.conv)
         self.conv["model"] = model
-        self.conv["messages"].append({"role": "user", "content": text})
+        msg = compose_message(text, atts)
+        self.conv["messages"].append(msg)
+        self.attachments = []
+        self._refresh_chips()
 
         self.stack.set_visible_child_name("chat")
         self._stick = True
         bubble = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.CROSSFADE, transition_duration=180,
-                              child=UserBubble(text))
+                              child=UserBubble(text, msg["_files"]))
         self.chat_box.append(bubble)
         GLib.idle_add(lambda: bubble.set_reveal_child(True) or False)
 
@@ -1784,6 +2159,7 @@ class Window(Adw.ApplicationWindow):
         executor = ToolExecutor(self)
         error = None
         info = self.model_info.get(model) or self._fetch_info(model)
+        think = self.think_value(model)
         try:
             for _ in range(MAX_AGENT_STEPS):
                 if self.cancel.is_set():
@@ -1796,6 +2172,8 @@ class Window(Adw.ApplicationWindow):
                 payload["options"], keep_alive = self.request_options(model, info)
                 if keep_alive is not None:
                     payload["keep_alive"] = keep_alive
+                if think is not None:
+                    payload["think"] = think
                 if tools_on:
                     payload["tools"] = TOOLS
 
@@ -1834,6 +2212,10 @@ class Window(Adw.ApplicationWindow):
                         tools_on = False
                         GLib.idle_add(self.toast, f"{model} can't use tools, so it will answer without them")
                         continue
+                    elif isinstance(e, OllamaError) and think is not None and "think" in str(e).lower():
+                        think = None
+                        GLib.idle_add(self.toast, f"{model} doesn't support that thinking setting; using its default")
+                        continue
                     else:
                         raise
                 finally:
@@ -1842,7 +2224,16 @@ class Window(Adw.ApplicationWindow):
                     on_main(step.finish, content, thinking)
                     on_main(step.set_stats, stats)
 
-                reply = {"role": "assistant", "content": content}
+                sent = sum(len(m.get("content") or "") + len(m.get("thinking") or "")
+                           + len(json.dumps(m.get("tool_calls") or "")) for m in payload["messages"])
+                if tools_on:
+                    sent += len(json.dumps(TOOLS))
+                estimate = estimate_tokens("x" * sent) + estimate_tokens(content + thinking)
+                reported = (stats.get("prompt_eval_count") or 0) + (stats.get("eval_count") or 0)
+                ctx = [reported, False] if reported and reported >= estimate * 0.5 else [estimate, True]
+                on_main(self._set_ctx, *ctx)
+
+                reply = {"role": "assistant", "content": content, "_ctx": ctx}
                 if thinking:
                     reply["thinking"] = thinking
                 if stats:
@@ -2015,6 +2406,7 @@ class Window(Adw.ApplicationWindow):
             info = parse_model_info(Ollama(self.cfg["host"]).show(model))
         except Exception:
             info = dict(EMPTY_INFO)
+        info["levels"] = "gpt-oss" in model or "gptoss" in info.get("family", "")
         self.model_info[model] = info
         return info
 
@@ -2041,6 +2433,8 @@ class Window(Adw.ApplicationWindow):
         if not overrides:
             store.pop(model, None)
         save_config(self.cfg)
+        if key == "num_ctx" and model == self.current_model():
+            self._update_ctx()
 
     def show_tuning(self):
         model = self.current_model()
@@ -2101,6 +2495,10 @@ class Window(Adw.ApplicationWindow):
         if info.get("ctx_max"):
             about_bits.append(f"context up to {info['ctx_max']:,} tokens")
         description = ", ".join(about_bits)
+        abilities = [label for key, label in (("thinking", "thinks before answering"), ("vision", "sees images"),
+                                              ("tools", "uses agent tools")) if info.get(key)]
+        if abilities:
+            description += ("\n" if description else "") + "Can: " + ", ".join(abilities) + "."
         if info.get("tools") is False:
             description += ("\n" if description else "") + "This model can't use agent tools."
         about = Adw.PreferencesGroup(title=model, description=description or None)
@@ -2142,6 +2540,8 @@ class Window(Adw.ApplicationWindow):
                 r()
             self.cfg.get("model_options", {}).pop(model, None)
             save_config(self.cfg)
+            if model == self.current_model():
+                self._apply_model_ui(model)
             self.toast(f"{model} is back to its defaults")
 
         reset_btn.connect("clicked", reset_all)
@@ -2218,7 +2618,7 @@ class Window(Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
         self.cfg = load_config()
 
     def _win(self):
@@ -2244,6 +2644,7 @@ class App(Adw.Application):
             ("new-chat", lambda *_: self._win().new_chat(), ["<primary>n"]),
             ("preferences", lambda *_: self._win().show_preferences(), ["<primary>comma"]),
             ("tune", lambda *_: self._win().show_tuning(), ["<primary>t"]),
+            ("attach", lambda *_: self._win().pick_files(), ["<primary>o"]),
             ("about", lambda *_: self._win().show_about(), []),
             ("quit", lambda *_: self.quit(), ["<primary>q"]),
         ]
@@ -2256,6 +2657,12 @@ class App(Adw.Application):
 
     def do_activate(self):
         self._win().present()
+
+    def do_open(self, files, *_):
+        """`ollama-desk notes.md photo.png` opens the window with those files attached."""
+        win = self._win()
+        win.present()
+        win.add_attachments([f.get_path() for f in files if f.get_path()])
 
 
 if __name__ == "__main__":
