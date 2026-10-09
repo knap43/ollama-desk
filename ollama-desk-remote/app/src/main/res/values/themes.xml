@@ -1,0 +1,10 @@
+<resources>
+    <!-- Always dark; matches the Compose theme so there's no flash of light while the app starts. -->
+    <style name="Theme.Remote" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window</item>
+        <item name="android:colorAccent">@color/amber</item>
+    </style>
+    <color name="window">#16130F</color>
+    <color name="amber">#E1A34F</color>
+    <color name="launcher_background">#16130F</color>
+</resources>
