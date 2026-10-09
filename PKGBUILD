@@ -1,0 +1,28 @@
+# Build and install with:  makepkg -si
+pkgname=ollama-desk
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="GTK4/libadwaita chat app for local Ollama models, with desktop agent tools"
+arch=('any')
+license=('MIT')
+depends=('python' 'python-gobject' 'gtk4' 'libadwaita')
+optdepends=('ollama: run the models on this computer (or ollama-cuda / ollama-rocm)'
+            'gtksourceview5: syntax highlighting in code blocks'
+            'poppler: attach PDFs and let the agent read them'
+            'webp-pixbuf-loader: attach WebP images'
+            'xdg-desktop-portal-gnome: screenshots for the agent'
+            'pipewire: voice recording and playback'
+            'uv: quicker, sturdier voice setup')
+source=('ollama_desk.py'
+        'io.github.ollamadesk.OllamaDesk.desktop'
+        'io.github.ollamadesk.OllamaDesk.svg')
+# Local files you may edit, so they aren't pinned to checksums.
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm755 ollama_desk.py "$pkgdir/usr/bin/ollama-desk"
+  install -Dm644 io.github.ollamadesk.OllamaDesk.desktop \
+    "$pkgdir/usr/share/applications/io.github.ollamadesk.OllamaDesk.desktop"
+  install -Dm644 io.github.ollamadesk.OllamaDesk.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.ollamadesk.OllamaDesk.svg"
+}
