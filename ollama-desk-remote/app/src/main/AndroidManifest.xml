@@ -24,10 +24,6 @@
             android:exported="true"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
             <!-- Opening an ollamadesk://pair link from elsewhere starts pairing -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -36,6 +32,41 @@
                 <data android:scheme="ollamadesk" android:host="pair" />
             </intent-filter>
         </activity>
+
+        <!-- Launcher entries, one per icon; the in-app Appearance setting enables exactly one. -->
+        <activity-alias
+            android:name="io.github.ollamadesk.remote.LauncherClassic"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name="io.github.ollamadesk.remote.LauncherColorful"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_colorful"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name="io.github.ollamadesk.remote.LauncherSystem"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_system"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
 
         <activity
             android:name="com.journeyapps.barcodescanner.CaptureActivity"
